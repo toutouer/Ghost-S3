@@ -19,7 +19,7 @@ type Config = {
   accessKeyId?: string
   assetHost?: string
   bucket?: string
-  pathPrefix?: string
+  pathPrefix?: string | { [key: string]: string }
   region?: string
   secretAccessKey?: string
   endpoint?: string
@@ -33,7 +33,7 @@ class S3Storage extends StorageBase {
   region?: string
   bucket?: string
   host: string
-  pathPrefix: string
+  pathPrefix: string | { [key: string]: string }
   endpoint: string
   forcePathStyle: boolean
   acl?: ObjectCannedACL
@@ -53,7 +53,6 @@ class S3Storage extends StorageBase {
       acl,
     } = config
 
-    // Compatible with the aws-sdk's default environment variables
     this.accessKeyId = accessKeyId
     this.secretAccessKey = secretAccessKey
     this.region = process.env.AWS_DEFAULT_REGION || region
@@ -62,7 +61,6 @@ class S3Storage extends StorageBase {
 
     if (!this.bucket) throw new Error('S3 bucket not specified')
 
-    // Optional configurations
     this.forcePathStyle =
       Boolean(process.env.GHOST_STORAGE_ADAPTER_S3_FORCE_PATH_STYLE) ||
       Boolean(forcePathStyle) ||
@@ -85,9 +83,14 @@ class S3Storage extends StorageBase {
       assetHost ||
       defaultHost
 
-    this.pathPrefix = stripLeadingSlash(
-      process.env.GHOST_STORAGE_ADAPTER_S3_PATH_PREFIX || pathPrefix || ''
-    )
+    this.pathPrefix = process.env.GHOST_STORAGE_ADAPTER_S3_PATH_PREFIX || pathPrefix || ''
+    if (typeof this.pathPrefix === 'string') {
+      this.pathPrefix = stripLeadingSlash(this.pathPrefix)
+    } else {
+      Object.keys(this.pathPrefix).forEach(key => {
+        this.pathPrefix[key] = stripLeadingSlash(this.pathPrefix[key])
+      })
+    }
     this.endpoint =
       process.env.GHOST_STORAGE_ADAPTER_S3_ENDPOINT || endpoint || ''
     this.acl = (process.env.GHOST_STORAGE_ADAPTER_S3_ACL ||
@@ -95,8 +98,24 @@ class S3Storage extends StorageBase {
       'public-read') as ObjectCannedACL
   }
 
+  private getPathPrefix(fileType: string): string {
+    if (typeof this.pathPrefix === 'string') {
+      return this.pathPrefix
+    }
+    return this.pathPrefix[fileType] || ''
+  }
+
+  private getFileType(fileName: string): string {
+    const ext = fileName.split('.').pop()?.toLowerCase()
+    if (['jpg', 'jpeg', 'png', 'gif', 'svg'].includes(ext)) return 'images'
+    if (['mp4', 'webm', 'ogg'].includes(ext)) return 'media'
+    return 'files'
+  }
+
   async delete(fileName: string, targetDir?: string) {
-    const directory = targetDir || this.getTargetDir(this.pathPrefix)
+    const fileType = this.getFileType(fileName)
+    const pathPrefix = this.getPathPrefix(fileType)
+    const directory = targetDir || this.getTargetDir(pathPrefix)
 
     try {
       await this.s3().deleteObject({
@@ -110,11 +129,13 @@ class S3Storage extends StorageBase {
   }
 
   async exists(fileName: string, targetDir?: string) {
+    const fileType = this.getFileType(fileName)
+    const pathPrefix = this.getPathPrefix(fileType)
     try {
       await this.s3().getObject({
         Bucket: this.bucket,
         Key: stripLeadingSlash(
-          targetDir ? join(targetDir, fileName) : fileName
+          targetDir ? join(targetDir, fileName) : join(pathPrefix, fileName)
         ),
       })
     } catch {
@@ -129,7 +150,6 @@ class S3Storage extends StorageBase {
       forcePathStyle: this.forcePathStyle,
     }
 
-    // Set credentials only if provided, falls back to AWS SDK's default provider chain
     if (this.accessKeyId && this.secretAccessKey) {
       options.credentials = {
         accessKeyId: this.accessKeyId,
@@ -143,15 +163,15 @@ class S3Storage extends StorageBase {
     return new S3(options)
   }
 
-  // Doesn't seem to be documented, but required for using this adapter for other media file types.
-  // Seealso: https://github.com/laosb/ghos3/pull/6
   urlToPath(url: string) {
     const parsedUrl = new URL(url)
     return parsedUrl.pathname
   }
 
   async save(image: Image, targetDir?: string) {
-    const directory = targetDir || this.getTargetDir(this.pathPrefix)
+    const fileType = this.getFileType(image.name)
+    const pathPrefix = this.getPathPrefix(fileType)
+    const directory = targetDir || this.getTargetDir(pathPrefix)
 
     const fileName = await this.getUniqueFileName(image, directory)
     const file = createReadStream(image.path)
@@ -172,9 +192,12 @@ class S3Storage extends StorageBase {
   serve(): Handler {
     return async (req, res, next) => {
       try {
+        const fileType = this.getFileType(req.path)
+        const pathPrefix = this.getPathPrefix(fileType)
+        const key = stripLeadingSlash(stripEndingSlash(pathPrefix) + req.path)
         const output = await this.s3().getObject({
           Bucket: this.bucket,
-          Key: stripLeadingSlash(stripEndingSlash(this.pathPrefix) + req.path),
+          Key: key,
         })
 
         const headers: { [key: string]: string } = {}
@@ -205,7 +228,6 @@ class S3Storage extends StorageBase {
   async read(options: ReadOptions = { path: '' }) {
     let path = (options.path || '').replace(/\/$|\\$/, '')
 
-    // check if path is stored in s3 handled by us
     if (!path.startsWith(this.host)) {
       throw new Error(`${path} is not stored in s3`)
     }
